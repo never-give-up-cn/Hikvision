@@ -54,10 +54,20 @@ class PanoramaCapture:
         pan_speed: int = 100,
         step_duration: float = 8.0,
         settle_time: float = 1.0,
+        callback=None,
     ):
+        """
+        Args:
+            callback: 可选回调函数，接收 dict 类型消息
+                      {"type": "log", "msg": "..."}
+                      {"type": "capture", "path": "...", "label": "..."}
+                      {"type": "panorama", "path": "..."}
+                      {"type": "status", "msg": "..."}
+        """
         self.config = config
         self.isapi = ISAPIClient(config)
         self.ptz = PTZController(config)
+        self.callback = callback
 
         self.output_base = Path(output_base)
         self.pan_steps = max(2, pan_steps)
@@ -71,6 +81,15 @@ class PanoramaCapture:
         self._calibrate_duration = 20.0
 
         self._stop_flag = False
+        self._latest_capture_path = None
+
+    def _cb(self, type_, **kwargs):
+        """触发回调"""
+        if self.callback:
+            try:
+                self.callback({"type": type_, **kwargs})
+            except Exception:
+                pass
 
     # ===================== 外部接口 =====================
 
@@ -103,6 +122,7 @@ class PanoramaCapture:
         logger.info(f"  预计耗时: {estimated_time:.0f}s ({estimated_time/60:.1f}min)")
         logger.info(f"  输出: {output_dir}")
         logger.info("=" * 55)
+        self._cb("status", msg="开始采集...")
 
         # 1. 校准 + 全范围扫描
         images = self._scan_full_range(output_dir)
@@ -112,10 +132,12 @@ class PanoramaCapture:
             return None
         if not images:
             logger.error("未采集到任何有效图片")
+            self._cb("status", msg="采集失败: 无有效图片")
             self._emergency_stop()
             return None
 
         logger.info(f"\n采集完成: {len(images)} 张有效图片")
+        self._cb("status", msg=f"采集完成: {len(images)} 张, 正在拼接...")
 
         # 2. 拼接全景图
         panorama_path = self._stitch_and_save(images, output_dir, timestamp)
@@ -290,6 +312,8 @@ class PanoramaCapture:
                 with open(save_path, "wb") as f:
                     f.write(img_data)
                 logger.info(f"  {label} ✓ ({len(img_data)} bytes)")
+                self._latest_capture_path = str(save_path)
+                self._cb("capture", path=str(save_path), label=label)
                 return True
 
             except ISAPIError as e:
@@ -323,9 +347,12 @@ class PanoramaCapture:
             h, w = pano.shape[:2]
             logger.info(f"全景图拼接成功! {w}x{h} ({file_size:.0f} KB)")
             logger.info(f"  -> {panorama_path}")
+            self._cb("panorama", path=str(panorama_path))
+            self._cb("status", msg=f"全景图完成: {w}x{h} ({file_size:.0f}KB)")
             return panorama_path
 
         logger.error("全景图拼接失败")
+        self._cb("status", msg="全景图拼接失败")
         return None
 
     def _stitch_feature_match(self, img_paths: List[Path]):
