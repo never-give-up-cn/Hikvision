@@ -216,10 +216,9 @@ class PanoramaCapture:
         """
         images = []
 
-        # === 阶段1: 校准 — 移动到左上极限 ===
-        logger.info("\n[校准] 移动到左上极限...")
+        # === 阶段1: 校准 — 移动到左侧极限（不调整俯仰，保留俯仰行程）===
+        logger.info("\n[校准] 移动到左侧极限...")
         self._move_by_continuous(pan=-self.pan_speed, tilt=0, duration=self._calibrate_duration)
-        self._move_by_continuous(pan=0, tilt=self.tilt_speed, duration=self._calibrate_duration * 0.5)
         logger.info("[校准] 到位")
 
         # === 阶段2: Z字形网格扫描（反馈式移动）===
@@ -236,14 +235,16 @@ class PanoramaCapture:
 
             logger.info(f"\n--- 第 {tilt_idx + 1}/{self.tilt_steps} 行 {'→' if row_dir == 1 else '←'} ---")
 
-            # 非第一行: 垂直下移（反馈式）
+            # 非第一行: 垂直移动（反馈式，撞死限后回退到定时移动）
             if tilt_idx > 0:
                 logger.info(f"  下移一行 (目标偏移 {self.pixel_shift})...")
                 moved = self._move_until_shift(pan=0, tilt=-self.tilt_speed,
-                                               target_shift=self.pixel_shift * 1.2)
+                                               target_shift=self.pixel_shift * 0.8)
                 if not moved:
-                    logger.warning(f"  [死限] 垂直方向到极限了，结束采集")
-                    return images
+                    # 反馈式失效（撞死限），改用定时移动确保能拍到
+                    logger.warning(f"  [回退] 反馈式俯仰失效，改用定时移动 3s")
+                    self._move_by_continuous(pan=0, tilt=-self.tilt_speed, duration=3.0)
+                    time.sleep(0.3)
                 time.sleep(self.settle_time)
 
             # 扫描本行各列
