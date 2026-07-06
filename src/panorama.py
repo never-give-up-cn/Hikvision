@@ -52,17 +52,21 @@ class PanoramaCapture:
         pan_steps: int = 8,
         tilt_steps: int = 3,
         pan_speed: int = 100,
-        step_duration: float = 8.0,
-        settle_time: float = 1.0,
+        pixel_shift: float = 40.0,
+        settle_time: float = 0.5,
         callback=None,
     ):
         """
         Args:
-            callback: 可选回调函数，接收 dict 类型消息
-                      {"type": "log", "msg": "..."}
-                      {"type": "capture", "path": "...", "label": "..."}
-                      {"type": "panorama", "path": "..."}
-                      {"type": "status", "msg": "..."}
+            config:         摄像头配置
+            output_base:    输出根目录
+            pan_steps:      水平步数
+            tilt_steps:     垂直行数
+            pan_speed:      水平移动速度 1-100
+            pixel_shift:    相邻两张图片的目标像素差异值（到达此值才停下拍照）
+                             越大每次转动角度越大，建议 30-60
+            settle_time:    到位后等待稳定的秒数
+            callback:       回调函数
         """
         self.config = config
         self.isapi = ISAPIClient(config)
@@ -74,8 +78,13 @@ class PanoramaCapture:
         self.tilt_steps = max(1, tilt_steps)
         self.pan_speed = min(100, max(10, pan_speed))
         self.tilt_speed = min(100, max(10, int(pan_speed * 0.7)))
-        self.step_duration = max(2.0, min(30.0, step_duration))
-        self.settle_time = max(0.3, settle_time)
+        self.pixel_shift = max(10.0, min(200.0, pixel_shift))
+        self.settle_time = max(0.2, settle_time)
+
+        # 移动控制参数
+        self._burst_duration = 0.5       # 每次微调的持续时间（秒）
+        self._max_bursts_per_step = 40   # 每步最多微调次数（防死循环）
+        self._deadzone_threshold = 3.0   # 死限判定阈值
 
         # 长距离移动到极限的时间
         self._calibrate_duration = 20.0
@@ -110,16 +119,14 @@ class PanoramaCapture:
         total_images = self.pan_steps * self.tilt_steps
         estimated_time = (
             self._calibrate_duration * 2
-            + self.pan_steps * self.step_duration * self.tilt_steps
-            + (self.tilt_steps - 1) * self.step_duration * 1.5
-            + total_images * (0.5 + self.settle_time)
+            + total_images * self._max_bursts_per_step * self._burst_duration * 0.5
         )
 
         logger.info("=" * 55)
-        logger.info(f"  全角度拍照采集")
+        logger.info(f"  全角度拍照采集（反馈式移动）")
         logger.info(f"  网格: {self.pan_steps}列 × {self.tilt_steps}行 = {total_images}张")
-        logger.info(f"  速度: {self.pan_speed}  每步: {self.step_duration}s")
-        logger.info(f"  预计耗时: {estimated_time:.0f}s ({estimated_time/60:.1f}min)")
+        logger.info(f"  速度: {self.pan_speed}  目标偏移: {self.pixel_shift}px")
+        logger.info(f"  预计耗时: ≈{estimated_time:.0f}s ({estimated_time/60:.1f}min)")
         logger.info(f"  输出: {output_dir}")
         logger.info("=" * 55)
         self._cb("status", msg="开始采集...")
@@ -215,11 +222,9 @@ class PanoramaCapture:
         self._move_by_continuous(pan=0, tilt=self.tilt_speed, duration=self._calibrate_duration * 0.5)
         logger.info("[校准] 到位")
 
-        # === 阶段2: Z字形网格扫描 ===
+        # === 阶段2: Z字形网格扫描（反馈式移动）===
         total_captures = self.pan_steps * self.tilt_steps
         capture_index = 0
-        prev_img_data = None  # 上一张图的像素数据，用于死限检测
-        DEADZONE_THRESHOLD = 5.0  # 平均像素差 < 此值视为撞到死限
 
         for tilt_idx in range(self.tilt_steps):
             if self._stop_flag:
@@ -231,10 +236,14 @@ class PanoramaCapture:
 
             logger.info(f"\n--- 第 {tilt_idx + 1}/{self.tilt_steps} 行 {'→' if row_dir == 1 else '←'} ---")
 
-            # 非第一行: 垂直下移
+            # 非第一行: 垂直下移（反馈式）
             if tilt_idx > 0:
-                logger.info(f"  下移一行...")
-                self._move_by_continuous(pan=0, tilt=-self.tilt_speed, duration=self.step_duration * 1.5)
+                logger.info(f"  下移一行 (目标偏移 {self.pixel_shift})...")
+                moved = self._move_until_shift(pan=0, tilt=-self.tilt_speed,
+                                               target_shift=self.pixel_shift * 1.2)
+                if not moved:
+                    logger.warning(f"  [死限] 垂直方向到极限了，结束采集")
+                    return images
                 time.sleep(self.settle_time)
 
             # 扫描本行各列
@@ -244,33 +253,35 @@ class PanoramaCapture:
 
                 pos_label = f"r{tilt_idx + 1}_c{col_idx + 1}"
 
-                # 非本行第一列: 水平移动
+                # 非本行第一列: 反馈式移动（转到画面偏移达标才停）
                 if col_idx != col_range[0]:
                     pan_val = self.pan_speed if row_dir == 1 else -self.pan_speed
-                    self._move_by_continuous(pan=pan_val, tilt=0, duration=self.step_duration)
 
-                    # ── 死限检测: 移动后快速比较图片是否变化 ──
-                    if prev_img_data is not None:
-                        check_data = self._quick_snapshot()
-                        if check_data and self._images_similar(prev_img_data, check_data, DEADZONE_THRESHOLD):
-                            logger.warning(f"  [死限] 转到极限了！跳过本行剩余位置")
-                            self._cb("status", msg=f"第 {tilt_idx+1} 行撞到死限，跳过")
-                            hit_deadzone = True
-                            # 把剩余位置的计数补上
-                            remaining = len(col_range) - col_range.index(col_idx) - 1
-                            for skip_idx in range(remaining):
-                                capture_index += 1
-                                self._cb("progress", current=capture_index, total=total_captures)
-                            # 补上空文件
-                            for skip_col in list(col_range)[col_range.index(col_idx) + 1:]:
-                                skip_label = f"r{tilt_idx + 1}_c{skip_col + 1}"
-                                skip_path = output_dir / f"{skip_label}.jpg"
-                                # 复制最后一张有效图作为占位
-                                if images:
-                                    import shutil
-                                    shutil.copy(str(images[-1][1]), str(skip_path))
-                                    images.append((skip_label, skip_path))
-                            break
+                    if row_dir == 1:
+                        logger.info(f"  → 右移 (目标偏移 {self.pixel_shift})")
+                    else:
+                        logger.info(f"  ← 左移 (目标偏移 {self.pixel_shift})")
+
+                    moved = self._move_until_shift(pan=pan_val, tilt=0)
+
+                    if not moved:
+                        # 撞到死限了
+                        logger.warning(f"  [死限] 转到极限了！跳过本行剩余位置")
+                        self._cb("status", msg=f"第 {tilt_idx+1} 行撞到死限，跳过")
+                        hit_deadzone = True
+                        # 跳过剩余位置（计数补上）
+                        remaining = len(col_range) - list(col_range).index(col_idx) - 1
+                        for skip_idx in range(remaining):
+                            capture_index += 1
+                            self._cb("progress", current=capture_index, total=total_captures)
+                        for skip_col in list(col_range)[list(col_range).index(col_idx) + 1:]:
+                            skip_label = f"r{tilt_idx + 1}_c{skip_col + 1}"
+                            skip_path = output_dir / f"{skip_label}.jpg"
+                            if images:
+                                import shutil
+                                shutil.copy(str(images[-1][1]), str(skip_path))
+                                images.append((skip_label, skip_path))
+                        break
 
                     time.sleep(self.settle_time)
 
@@ -285,12 +296,6 @@ class PanoramaCapture:
                 success = self._capture_single(img_path, label=label)
                 if success:
                     images.append((pos_label, img_path))
-                    # 保存像素数据用于死限检测
-                    try:
-                        with open(img_path, "rb") as f:
-                            prev_img_data = f.read()
-                    except Exception:
-                        pass
                 else:
                     logger.warning(f"  {label} 采集失败")
 
@@ -298,20 +303,12 @@ class PanoramaCapture:
         self.ptz.stop()
         return images
 
-    # ---------- 云台移动 ----------
+    # ---------- 云台移动（反馈式）----------
 
     def _move_by_continuous(self, pan: float = 0, tilt: float = 0, duration: float = 1.0):
-        """
-        连续移动指定时间后停止
-
-        Args:
-            pan:   水平速度 -100~100（正=右，负=左）
-            tilt:  垂直速度 -100~100（正=上，负=下）
-            duration: 移动持续秒数
-        """
+        """连续移动指定时间后停止（用于校准阶段）"""
         if self._stop_flag:
             return
-
         self.isapi.ptz_continuous_move(pan=int(pan), tilt=int(tilt), zoom=0)
         if duration > 0:
             remaining = duration
@@ -322,6 +319,75 @@ class PanoramaCapture:
             if not self._stop_flag:
                 self.ptz.stop()
 
+    def _move_until_shift(self, pan: float = 0, tilt: float = 0,
+                          target_shift: Optional[float] = None) -> bool:
+        """
+        反馈式移动：增量移动直到画面变化量达标
+
+        不断重复: 移动小幅度(0.5s) → 抓拍对比 → 够了吗？
+        确保无论速度快慢、角度大小，每次移动后画面变化量基本一致。
+
+        Args:
+            pan:   水平速度 -100~100
+            tilt:  垂直速度 -100~100
+            target_shift: 目标像素差异值，None 则用 self.pixel_shift
+
+        Returns:
+            True  = 到达目标位置（或超时结束）
+            False = 撞到死限（画面不再变化）
+        """
+        if self._stop_flag:
+            return False
+
+        target = target_shift or self.pixel_shift
+
+        # 移动前先抓一张参考图
+        ref_data = self._quick_snapshot()
+        if ref_data is None:
+            # 抓不到参考图，就用固定时间移动
+            self._move_by_continuous(pan=pan, tilt=tilt, duration=self._burst_duration * 4)
+            return True
+
+        no_change_count = 0
+        total_shift = 0.0
+
+        for burst in range(self._max_bursts_per_step):
+            if self._stop_flag:
+                return False
+
+            # 移动一小步
+            self.isapi.ptz_continuous_move(pan=int(pan), tilt=int(tilt), zoom=0)
+            time.sleep(self._burst_duration)
+            self.ptz.stop()
+            time.sleep(0.1)
+
+            # 抓拍检查
+            check_data = self._quick_snapshot()
+            if check_data is None:
+                continue
+
+            # 和参考图对比
+            shift = self._image_diff(ref_data, check_data)
+            total_shift += shift
+
+            logger.info(f"    移动脉冲 {burst+1}: 累计偏移 {total_shift:.1f} (目标 {target})")
+
+            if total_shift >= target:
+                logger.info(f"    ✓ 目标达成! 累计偏移 {total_shift:.1f}")
+                return True
+
+            # 死限检测：连续几次偏移接近0
+            if shift < self._deadzone_threshold:
+                no_change_count += 1
+                if no_change_count >= 3:
+                    logger.warning(f"    [死限] 连续 {no_change_count} 次无变化, 撞到限位")
+                    return False
+            else:
+                no_change_count = 0
+
+        logger.info(f"    超时结束, 累计偏移 {total_shift:.1f} (目标 {target})")
+        return True
+
     # ---------- 死限检测 ----------
 
     def _quick_snapshot(self) -> Optional[bytes]:
@@ -331,31 +397,31 @@ class PanoramaCapture:
         except Exception:
             return None
 
-    def _images_similar(self, img_a: bytes, img_b: bytes, threshold: float = 5.0) -> bool:
+    def _image_diff(self, img_a: bytes, img_b: bytes) -> float:
         """
-        判断两张图片是否相似（平均像素差 < threshold）
-        用于检测摄像头是否撞到死限
+        计算两张图片的平均像素差异值
+
+        Args:
+            img_a, img_b: JPEG 字节数据
 
         Returns:
-            True = 图片相似 → 可能撞死限了
+            平均像素差异 (0~255)，越大表示画面变化越大
         """
         try:
             import cv2, numpy as np
             if len(img_a) < 100 or len(img_b) < 100:
-                return False
+                return 0.0
 
-            # 解码并缩放到小尺寸加速比较
             a = cv2.imdecode(np.frombuffer(img_a, np.uint8), cv2.IMREAD_GRAYSCALE)
             b = cv2.imdecode(np.frombuffer(img_b, np.uint8), cv2.IMREAD_GRAYSCALE)
             if a is None or b is None:
-                return False
+                return 0.0
 
             a_small = cv2.resize(a, (64, 48))
             b_small = cv2.resize(b, (64, 48))
-            diff = np.abs(a_small.astype(int) - b_small.astype(int)).mean()
-            return diff < threshold
+            return float(np.abs(a_small.astype(int) - b_small.astype(int)).mean())
         except Exception:
-            return False
+            return 0.0
 
     # ---------- 抓拍 ----------
 
@@ -538,7 +604,7 @@ class PanoramaCapture:
             "panorama": str(panorama_path) if panorama_path else "failed",
             "params": {
                 "pan_speed": self.pan_speed,
-                "step_duration": self.step_duration,
+                "pixel_shift": self.pixel_shift,
             }
         }
         log_path = output_dir / "capture_log.json"

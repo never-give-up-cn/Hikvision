@@ -241,7 +241,7 @@ class PanoramaApp(ctk.CTk):
                 pan_steps=8,
                 tilt_steps=3,
                 pan_speed=100,
-                step_duration=8.0,
+                pixel_shift=40.0,
             )
             result = capture.capture()
             if result is None:

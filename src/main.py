@@ -171,11 +171,11 @@ def cmd_snapshot(client: ISAPIClient, output: str):
         return 1
 
 
-def cmd_panorama(config, pan_steps, tilt_steps, speed, step_duration):
+def cmd_panorama(config, pan_steps, tilt_steps, speed, pixel_shift):
     """单次全景图采集"""
     print("\n=== 全景图采集 ===")
     print(f"网格: {pan_steps}列 × {tilt_steps}行 ({pan_steps * tilt_steps}张)")
-    print(f"速度: {speed}  步长: {step_duration}s")
+    print(f"速度: {speed}  目标偏移: {pixel_shift}px")
     print("开始采集（按 Ctrl+C 停止）...\n")
 
     # 配置日志
@@ -186,7 +186,7 @@ def cmd_panorama(config, pan_steps, tilt_steps, speed, step_duration):
         pan_steps=pan_steps,
         tilt_steps=tilt_steps,
         pan_speed=speed,
-        step_duration=step_duration,
+        pixel_shift=pixel_shift,
     )
     try:
         result = pano.capture()
@@ -202,7 +202,7 @@ def cmd_panorama(config, pan_steps, tilt_steps, speed, step_duration):
         return 0
 
 
-def cmd_auto(config, interval, pan_steps, tilt_steps, speed, step_duration):
+def cmd_auto(config, interval, pan_steps, tilt_steps, speed, pixel_shift):
     """自动循环全景图采集"""
     print(f"\n=== 自动全景图模式 ===")
     print(f"间隔: {interval} 分钟")
@@ -220,7 +220,7 @@ def cmd_auto(config, interval, pan_steps, tilt_steps, speed, step_duration):
         pan_steps=pan_steps,
         tilt_steps=tilt_steps,
         pan_speed=speed,
-        step_duration=step_duration,
+        pixel_shift=pixel_shift,
     )
     try:
         pano.auto_loop(interval_minutes=interval)
@@ -277,8 +277,8 @@ def main():
                         help="水平方向步数（默认 8，覆盖全角度）")
     parser.add_argument("--tilt-steps", type=int, default=3,
                         help="垂直方向行数（默认 3）")
-    parser.add_argument("--step-duration", type=float, default=8.0,
-                        help="每步移动秒数（默认 8.0，越大覆盖角度越广）")
+    parser.add_argument("--pixel-shift", type=float, default=40.0,
+                        help="每步画面偏移量，画面变化达标才停（默认 40）")
 
     args = parser.parse_args()
 
@@ -319,10 +319,10 @@ def main():
             return cmd_snapshot(client, args.snapshot)
 
         if args.panorama:
-            return cmd_panorama(config, args.pan_steps, args.tilt_steps, args.speed, args.step_duration)
+            return cmd_panorama(config, args.pan_steps, args.tilt_steps, args.speed, args.pixel_shift)
 
         if args.auto:
-            return cmd_auto(config, args.interval, args.pan_steps, args.tilt_steps, args.speed, args.step_duration)
+            return cmd_auto(config, args.interval, args.pan_steps, args.tilt_steps, args.speed, args.pixel_shift)
 
     except ISAPIError as e:
         print(f"[FAIL] ISAPI 错误: {e}")
