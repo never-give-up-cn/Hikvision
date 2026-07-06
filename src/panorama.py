@@ -1,16 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-全景图采集与拼接模块
-
-自动控制 PTZ 摄像头遍历多角度抓拍，使用 OpenCV 特征匹配拼接全景图。
-输出到 img/YYYY-MM-DD/HHMMSS/ 目录。
+全景图采集与拼接模块 — v0.13 全角度覆盖
 
 工作流程:
-  1. 定义采集网格（水平 N 列 × 垂直 M 行）
-  2. 云台连续移动 + 定时停止，遍历网格每个位置
-  3. 每个位置抓拍一张 JPEG
-  4. OpenCV Stitcher 拼接所有图片
-  5. 保存单帧 + 全景图到日期目录
+  1. 校准: 移动到左上极限（确保起始位置确定）
+  2. 全范围扫描: Z字形遍历网格，速度100，每步长时间
+  3. 特征匹配拼接: ORB + RANSAC 逐对拼接
+  4. 输出到 img/YYYY-MM-DD/HHMMSS/
+
+关键改进:
+  - 满量程覆盖: 移动到极限位置再逐步扫描
+  - 多特征拼接: ORB(3000点) + BFMatcher + RANSAC
+  - 自动重试: 抓拍失败自动重试
 """
 
 import cv2
@@ -18,7 +19,6 @@ import os
 import json
 import time
 import logging
-import threading
 import numpy as np
 from pathlib import Path
 from datetime import datetime
@@ -33,43 +33,42 @@ logger = logging.getLogger("panorama")
 
 class PanoramaCapture:
     """
-    全景图采集器
+    全景图采集器 — 全角度覆盖版本
 
     参数:
-      config: 摄像头配置
-      output_base: 输出根目录（默认 ./img）
-
-    采集网格:
-      pan_steps:   水平方向步数（图像列数）
-      tilt_steps:  垂直方向步数（图像行数）
-      pan_speed:   水平移动速度 (1-100)
-      tilt_speed:  垂直移动速度 (1-100)
-      step_duration: 每次移动持续时间（秒），决定相邻位置角度间距
-      settle_time: 移动到位后等待稳定的时间（秒）
+      config:         摄像头配置
+      output_base:    输出根目录（默认 ./img）
+      pan_steps:      水平步数（越多覆盖越细）
+      tilt_steps:     垂直行数
+      pan_speed:      水平移动速度 1-100（建议 80-100）
+      step_duration:  每步移动秒数（建议 6-10，越大相邻图片差异越大）
+      settle_time:    到位后等待稳定的秒数
     """
 
     def __init__(
         self,
         config: CameraConfig,
         output_base: str = "img",
-        pan_steps: int = 6,
-        tilt_steps: int = 2,
-        pan_speed: int = 40,
-        tilt_speed: int = 30,
-        step_duration: float = 2.5,
-        settle_time: float = 0.5,
+        pan_steps: int = 8,
+        tilt_steps: int = 3,
+        pan_speed: int = 100,
+        step_duration: float = 8.0,
+        settle_time: float = 1.0,
     ):
         self.config = config
         self.isapi = ISAPIClient(config)
         self.ptz = PTZController(config)
 
         self.output_base = Path(output_base)
-        self.pan_steps = pan_steps
+        self.pan_steps = max(2, pan_steps)
         self.tilt_steps = max(1, tilt_steps)
-        self.pan_speed = min(100, max(1, pan_speed))
-        self.tilt_speed = min(100, max(1, tilt_speed))
-        self.step_duration = max(0.5, step_duration)
-        self.settle_time = max(0.1, settle_time)
+        self.pan_speed = min(100, max(10, pan_speed))
+        self.tilt_speed = min(100, max(10, int(pan_speed * 0.7)))
+        self.step_duration = max(2.0, min(30.0, step_duration))
+        self.settle_time = max(0.3, settle_time)
+
+        # 长距离移动到极限的时间
+        self._calibrate_duration = 20.0
 
         self._stop_flag = False
 
@@ -77,7 +76,7 @@ class PanoramaCapture:
 
     def capture(self) -> Optional[Path]:
         """
-        执行一次完整的全景图采集流程
+        执行一次完整的全角度全景图采集
 
         Returns:
           全景图文件路径，失败返回 None
@@ -89,60 +88,69 @@ class PanoramaCapture:
         output_dir = self.output_base / date_str / time_str
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        logger.info("=" * 50)
-        logger.info("开始全景图采集")
-        logger.info(f"  网格: {self.pan_steps}列 × {self.tilt_steps}行 = {self.pan_steps * self.tilt_steps}张")
-        logger.info(f"  输出: {output_dir}")
-        logger.info("=" * 50)
+        total_images = self.pan_steps * self.tilt_steps
+        estimated_time = (
+            self._calibrate_duration * 2  # 移动到左上极限
+            + self.pan_steps * self.step_duration * self.tilt_steps  # 水平移动
+            + (self.tilt_steps - 1) * self.step_duration * 1.5  # 垂直移动
+            + total_images * (0.5 + self.settle_time)  # 抓拍耗时
+        )
 
-        # 第一步：采集所有位置的图片
-        images = self._capture_grid(output_dir)
+        logger.info("=" * 55)
+        logger.info(f"  全角度全景图采集")
+        logger.info(f"  网格: {self.pan_steps}列 × {self.tilt_steps}行 = {total_images}张")
+        logger.info(f"  速度: {self.pan_speed}  每步: {self.step_duration}s")
+        logger.info(f"  预计耗时: {estimated_time:.0f}s ({estimated_time/60:.1f}min)")
+        logger.info(f"  输出: {output_dir}")
+        logger.info("=" * 55)
+
+        # 1. 校准 + 全范围扫描
+        images = self._scan_full_range(output_dir)
         if self._stop_flag:
             logger.warning("采集被中断")
+            self._emergency_stop()
             return None
         if not images:
             logger.error("未采集到任何有效图片")
+            self._emergency_stop()
             return None
 
-        logger.info(f"采集完成: {len(images)} 张有效图片")
+        logger.info(f"\n采集完成: {len(images)} 张有效图片")
 
-        # 第二步：拼接全景图
+        # 2. 拼接全景图
         panorama_path = self._stitch_and_save(images, output_dir, timestamp)
 
-        # 第三步：保存采集日志
+        # 3. 保存日志
         self._save_log(output_dir, timestamp, len(images), panorama_path)
 
         return panorama_path
 
     def auto_loop(self, interval_minutes: int = 5):
-        """
-        自动循环模式，每隔 interval_minutes 分钟采集一次
-
-        按 Ctrl+C 停止
-        """
-        logger.info(f"自动模式启动，每 {interval_minutes} 分钟采集一次")
-        logger.info("按 Ctrl+C 停止")
+        """自动循环模式"""
+        logger.info(f"\n{'='*55}")
+        logger.info(f"  自动全景图模式启动")
+        logger.info(f"  采集间隔: 每 {interval_minutes} 分钟")
+        logger.info(f"  按 Ctrl+C 停止")
+        logger.info(f"{'='*55}\n")
 
         while not self._stop_flag:
             try:
                 start_time = time.time()
                 self.capture()
                 elapsed = time.time() - start_time
-                sleep_time = max(1, interval_minutes * 60 - elapsed)
+                sleep_time = max(10, interval_minutes * 60 - elapsed)
 
-                next_time = datetime.now().timestamp() + sleep_time
-                next_dt = datetime.fromtimestamp(next_time)
-                logger.info(f"下次采集: {next_dt.strftime('%H:%M:%S')} ({int(sleep_time)}秒后)")
+                next_dt = datetime.fromtimestamp(time.time() + sleep_time)
+                logger.info(f"\n下次采集: {next_dt.strftime('%H:%M:%S')} ({int(sleep_time)}秒后)")
 
-                # 分段等待，支持中断
-                wait_interval = 1.0  # 每秒检查一次中断
+                # 分段等待，支持快速中断
                 while sleep_time > 0 and not self._stop_flag:
-                    time.sleep(min(wait_interval, sleep_time))
-                    sleep_time -= wait_interval
+                    time.sleep(min(0.5, sleep_time))
+                    sleep_time -= 0.5
 
             except KeyboardInterrupt:
-                logger.info("用户中断")
-                self.stop()
+                logger.info("\n用户中断")
+                self._emergency_stop()
                 break
             except Exception as e:
                 logger.error(f"采集异常: {e}")
@@ -152,22 +160,94 @@ class PanoramaCapture:
     def stop(self):
         """安全停止"""
         self._stop_flag = True
-        logger.info("正在停止...")
+        self._emergency_stop()
+
+    # ===================== 内部方法 =====================
+
+    def _emergency_stop(self):
+        """紧急停止云台"""
         try:
             self.ptz.stop()
             logger.info("云台已停止")
         except Exception:
             pass
 
-    # ===================== 内部方法 =====================
+    # ---------- 全角度扫描 ----------
+
+    def _scan_full_range(self, output_dir: Path) -> List[Tuple[str, Path]]:
+        """
+        全范围网格扫描
+
+        策略:
+          1. 移动到左上极限
+          2. 从左到右逐列扫描（速度100，步长时间）
+          3. 下移一行
+          4. 从右到左扫描（Z字形）
+          5. 重复直到所有行完成
+        """
+        images = []
+
+        # === 阶段1: 校准 — 移动到左上极限 ===
+        logger.info("\n[校准] 移动到左上极限...")
+        self._move_by_continuous(pan=-self.pan_speed, tilt=0, duration=self._calibrate_duration)
+        self._move_by_continuous(pan=0, tilt=self.tilt_speed, duration=self._calibrate_duration * 0.5)
+        logger.info("[校准] 到位")
+
+        # === 阶段2: Z字形网格扫描 ===
+        for tilt_idx in range(self.tilt_steps):
+            if self._stop_flag:
+                return images
+
+            row_dir = 1 if tilt_idx % 2 == 0 else -1  # 偶数行→右, 奇数行→左
+            col_range = range(self.pan_steps) if row_dir == 1 else range(self.pan_steps - 1, -1, -1)
+
+            logger.info(f"\n--- 第 {tilt_idx + 1}/{self.tilt_steps} 行 {'→' if row_dir == 1 else '←'} ---")
+
+            # 非第一行: 垂直下移
+            if tilt_idx > 0:
+                logger.info(f"  下移一行...")
+                self._move_by_continuous(pan=0, tilt=-self.tilt_speed, duration=self.step_duration * 1.5)
+                time.sleep(self.settle_time)
+
+            # 扫描本行各列
+            for col_idx in col_range:
+                if self._stop_flag:
+                    return images
+
+                pos_label = f"r{tilt_idx + 1}_c{col_idx + 1}"
+
+                # 非本行第一列: 水平移动
+                if col_idx != col_range[0]:
+                    # 偶数行→右, 奇数行←左
+                    pan_val = self.pan_speed if row_dir == 1 else -self.pan_speed
+                    self._move_by_continuous(pan=pan_val, tilt=0, duration=self.step_duration)
+                    time.sleep(self.settle_time)
+
+                # 抓拍
+                if self._stop_flag:
+                    return images
+
+                img_path = output_dir / f"{pos_label}.jpg"
+                label = f"[{pos_label}]"
+                success = self._capture_single(img_path, label=label)
+                if success:
+                    images.append((pos_label, img_path))
+                else:
+                    logger.warning(f"  {label} 采集失败")
+
+        # 停止云台
+        self.ptz.stop()
+        return images
+
+    # ---------- 云台移动 ----------
 
     def _move_by_continuous(self, pan: float = 0, tilt: float = 0, duration: float = 1.0):
         """
         连续移动指定时间后停止
 
         Args:
-            pan: 水平速度 (-100 ~ 100)，正=右，负=左
-            tilt: 垂直速度 (-100 ~ 100)，正=上，负=下
+            pan:   水平速度 -100~100（正=右，负=左）
+            tilt:  垂直速度 -100~100（正=上，负=下）
             duration: 移动持续秒数
         """
         if self._stop_flag:
@@ -175,230 +255,92 @@ class PanoramaCapture:
 
         self.isapi.ptz_continuous_move(pan=int(pan), tilt=int(tilt), zoom=0)
         if duration > 0:
-            # 分段等待以支持中断
             remaining = duration
-            chunk = 0.1
+            chunk = 0.2
             while remaining > 0 and not self._stop_flag:
                 time.sleep(min(chunk, remaining))
                 remaining -= chunk
             if not self._stop_flag:
                 self.ptz.stop()
 
-    def _capture_grid(self, output_dir: Path) -> List[Tuple[str, Path]]:
-        """
-        遍历网格位置并采集图片
+    # ---------- 抓拍 ----------
 
-        Returns:
-            [(position_label, file_path), ...] 格式的列表
-        """
-        images = []
-
-        # --- Step 1: 移动到起始位置（左上角）---
-        # 先向左转，再向上转，到达起始区域
-        logger.info("移动到起始位置...")
-        self._move_left_pre()
-        self._move_up_pre()
-
-        # --- Step 2: Z 字形遍历网格 ---
-        # 从左到右扫描一行，然后下移一行，再从右到左扫描
-        for tilt_idx in range(self.tilt_steps):
-            row_direction = 1 if tilt_idx % 2 == 0 else -1  # 偶数行→右，奇数行→左
-            pan_range = range(self.pan_steps) if row_direction == 1 else range(self.pan_steps - 1, -1, -1)
-
-            # 移动到本行起始位置
-            if tilt_idx > 0:
-                logger.info(f"下移一行 ({tilt_idx + 1}/{self.tilt_steps})")
-                self._move_by_continuous(pan=0, tilt=-self.tilt_speed, duration=self.step_duration)
-                # 如果奇数行，也左移一列（回到最左）
-                if row_direction == -1:
-                    self._move_by_continuous(pan=-self.pan_speed, tilt=0, duration=self.step_duration * (self.pan_steps - 1))
-
-            for col_idx in pan_range:
-                if self._stop_flag:
-                    return images
-
-                pos_label = f"r{tilt_idx + 1}_c{col_idx + 1}"
-
-                # 非第一列：水平移动
-                if col_idx != pan_range[0]:
-                    # 确定方向（Z 字形）
-                    if row_direction == 1:
-                        self._move_by_continuous(pan=self.pan_speed, tilt=0, duration=self.step_duration)
-                    else:
-                        self._move_by_continuous(pan=-self.pan_speed, tilt=0, duration=self.step_duration)
-
-                # 等待稳定
-                time.sleep(self.settle_time)
-                if self._stop_flag:
-                    return images
-
-                # 抓拍
-                logger.info(f"  [{pos_label}] 采集...")
-                img_path = output_dir / f"{pos_label}.jpg"
-                success = self._capture_single(img_path)
-                if success:
-                    images.append((pos_label, img_path))
-                else:
-                    logger.warning(f"  [{pos_label}] 采集失败")
-
-        # 回到中间位置
-        logger.info("采集完成，停止云台")
-        self.ptz.stop()
-
-        return images
-
-    def _move_left_pre(self):
-        """向左移动到起始位置（约 2 秒）"""
-        self._move_by_continuous(pan=-self.pan_speed, tilt=0, duration=2.5)
-        self.ptz.stop()
-
-    def _move_up_pre(self):
-        """向上移动到起始位置（约 1 秒）"""
-        self._move_by_continuous(pan=0, tilt=self.tilt_speed, duration=1.0)
-        self.ptz.stop()
-
-    def _capture_single(self, save_path: Path, retries: int = 3) -> bool:
-        """抓拍并保存单张图片
-
-        Args:
-            save_path: 保存路径
-            retries: 重试次数（摄像头繁忙时自动重试）
-        """
+    def _capture_single(self, save_path: Path, retries: int = 3,
+                        label: str = "") -> bool:
+        """抓拍并保存单张图片"""
         for attempt in range(1, retries + 1):
             if self._stop_flag:
                 return False
 
             try:
-                if attempt > 1:
-                    wait = attempt * 1.0  # 递增等待: 1s, 2s, 3s
-                    logger.info(f"  等待 {wait:.0f}s 后重试 ({attempt}/{retries})...")
-                    time.sleep(wait)
-
                 img_data = self.isapi.get_snapshot()
 
                 if img_data is None or len(img_data) < 100:
-                    logger.warning(f"  抓取结果为空 (尝试 {attempt}/{retries})")
+                    logger.info(f"  {label} 结果为空 (重试 {attempt}/{retries})")
+                    time.sleep(attempt)
                     continue
 
-                # 检查是否返回了 XML 错误
+                # 检查是否返回 XML 错误（设备繁忙）
                 if img_data[:5] == b'<?xml' or img_data[:5] == b'<Resp':
-                    logger.warning(f"  摄像头返回错误 (尝试 {attempt}/{retries})")
-                    # 尝试解析错误原因
-                    try:
-                        text = img_data[:500].decode("utf-8", errors="ignore")
-                        if "deviceBusy" in text or "Device Busy" in text:
-                            logger.warning("  摄像头繁忙（可能有人在看画面）")
-                    except Exception:
-                        pass
+                    logger.info(f"  {label} 摄像头繁忙 (重试 {attempt}/{retries})")
+                    time.sleep(attempt * 1.5)
                     continue
 
-                # 保存图片
+                # 保存
                 with open(save_path, "wb") as f:
                     f.write(img_data)
-                logger.info(f"  -> 已保存 ({len(img_data)} bytes)")
+                logger.info(f"  {label} ✓ ({len(img_data)} bytes)")
                 return True
 
             except ISAPIError as e:
-                logger.warning(f"  -> ISAPI异常: {e} (尝试 {attempt}/{retries})")
-                continue
-            except Exception as e:
-                logger.warning(f"  -> 保存异常: {e} (尝试 {attempt}/{retries})")
+                logger.info(f"  {label} 异常: {e} (重试 {attempt}/{retries})")
+                time.sleep(1)
                 continue
 
-        logger.error(f"  [失败] 经 {retries} 次重试仍无法获取图片")
+        logger.warning(f"  {label} ✗ 经 {retries} 次重试仍失败")
         return False
+
+    # ---------- 拼接 ----------
 
     def _stitch_and_save(
         self, images: List[Tuple[str, Path]], output_dir: Path, timestamp: datetime
     ) -> Optional[Path]:
-        """
-        拼接全景图
-
-        使用 OpenCV 内置 Stitcher，如果失败则尝试特征匹配回退方案。
-
-        Args:
-            images: [(label, path), ...]
-            output_dir: 输出目录
-
-        Returns:
-            全景图路径，失败返回 None
-        """
+        """拼接全景图（特征匹配为主）"""
         if not images or len(images) < 2:
-            logger.warning("图片不足 2 张，无法拼接")
+            logger.warning("图片不足2张，无法拼接")
             return None
 
         img_paths = [p for _, p in images]
         panorama_path = output_dir / "panorama.jpg"
 
-        logger.info(f"正在拼接全景图 ({len(img_paths)} 张)...")
+        logger.info(f"\n正在拼接全景图 ({len(img_paths)} 张)...")
 
-        # --- 方法1: OpenCV Stitcher ---
-        pano = self._stitch_opencv(img_paths)
-        if pano is not None:
-            cv2.imwrite(str(panorama_path), pano)
-            file_size = os.path.getsize(panorama_path) / 1024
-            logger.info(f"全景图拼接成功! -> {panorama_path} ({file_size:.0f} KB)")
-            return panorama_path
-
-        # --- 方法2: 特征匹配拼接 ---
-        logger.warning("Stitcher 失败，尝试特征匹配拼接...")
+        # 特征匹配拼接（已证明比 OpenCV Stitcher 更可靠）
         pano = self._stitch_feature_match(img_paths)
         if pano is not None:
             cv2.imwrite(str(panorama_path), pano)
             file_size = os.path.getsize(panorama_path) / 1024
-            logger.info(f"特征匹配拼接成功! -> {panorama_path} ({file_size:.0f} KB)")
+            h, w = pano.shape[:2]
+            logger.info(f"全景图拼接成功! {w}x{h} ({file_size:.0f} KB)")
+            logger.info(f"  -> {panorama_path}")
             return panorama_path
 
-        logger.error("所有拼接方法均失败")
+        logger.error("全景图拼接失败")
         return None
-
-    def _stitch_opencv(self, img_paths: List[Path]):
-        """OpenCV Stitcher 拼接"""
-        try:
-            imgs = []
-            for p in img_paths:
-                img = cv2.imread(str(p))
-                if img is not None:
-                    imgs.append(img)
-
-            if len(imgs) < 2:
-                return None
-
-            # OpenCV 5.x API
-            try:
-                stitcher = cv2.Stitcher.create(cv2.Stitcher_PANORAMA)
-                status, pano = stitcher.stitch(imgs)
-            except AttributeError:
-                # OpenCV 4.x fallback
-                stitcher = cv2.Stitcher.create()
-                status, pano = stitcher.stitch(imgs)
-
-            if status == cv2.Stitcher_OK:
-                return pano
-
-            logger.warning(f"  Stitcher 返回错误码: {status}")
-            if status == cv2.Stitcher_ERR_NEED_MORE_IMGS:
-                logger.warning("  -> 需要更多图片（FOV 重叠不够）")
-            return None
-
-        except Exception as e:
-            logger.warning(f"  OpenCV Stitcher 异常: {e}")
-            return None
 
     def _stitch_feature_match(self, img_paths: List[Path]):
         """
-        特征匹配拼接（ORB + RANSAC）
+        特征匹配拼接 — 按顺序两两拼接
 
-        适用于图片数量较少或 Stitcher 失败的情况。
-        按顺序两两拼接。
+        使用 ORB + BFMatcher + RANSAC 逐对拼接，
+        支持大位移和小位移场景。
         """
         try:
-            # 读取第一张
-            result = cv2.imread(str(img_paths[0]))
-            if result is None:
+            canvas = cv2.imread(str(img_paths[0]))
+            if canvas is None:
                 return None
 
-            orb = cv2.ORB_create(nfeatures=2000)
+            orb = cv2.ORB_create(nfeatures=3000)
             bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
 
             for i in range(1, len(img_paths)):
@@ -409,77 +351,94 @@ class PanoramaCapture:
                 if img_right is None:
                     continue
 
-                # 检测特征
-                kp1, des1 = orb.detectAndCompute(result, None)
-                kp2, des2 = orb.detectAndCompute(img_right, None)
+                hL, wL = canvas.shape[:2]
+                hR, wR = img_right.shape[:2]
 
-                if des1 is None or des2 is None or len(kp1) < 10 or len(kp2) < 10:
-                    logger.warning(f"  第 {i+1} 张特征点不足，跳过")
+                # --- 特征检测 ---
+                kpL, desL = orb.detectAndCompute(canvas, None)
+                kpR, desR = orb.detectAndCompute(img_right, None)
+
+                if desL is None or desR is None or len(kpL) < 8 or len(kpR) < 8:
+                    logger.info(f"   [{i+1}] 特征点不足, 跳过")
                     continue
 
-                # 特征匹配
-                matches = bf.match(des1, des2)
+                # --- 特征匹配 ---
+                matches = bf.match(desL, desR)
                 matches = sorted(matches, key=lambda x: x.distance)
 
-                if len(matches) < 10:
-                    logger.warning(f"  第 {i+1} 张匹配点不足 ({len(matches)}), 跳过")
+                # 取优质匹配（前40%）
+                good = matches[:max(20, int(len(matches) * 0.4))]
+                if len(good) < 8:
+                    logger.info(f"   [{i+1}] 优质匹配不足 ({len(good)}), 跳过")
+                    canvas = img_right  # 重新开始
                     continue
 
-                # RANSAC 计算单应性矩阵
-                src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
-                dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
-
-                H, mask = cv2.findHomography(dst_pts, src_pts, cv2.RANSAC, 5.0)
+                # --- 单应性矩阵 (右→左) ---
+                src_pts = np.float32([kpR[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+                dst_pts = np.float32([kpL[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+                H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
 
                 if H is None:
-                    logger.warning(f"  第 {i+1} 张无法计算变换矩阵，跳过")
+                    logger.info(f"   [{i+1}] 无法计算变换矩阵, 跳过")
                     continue
 
-                # 计算画布大小
-                h1, w1 = result.shape[:2]
-                h2, w2 = img_right.shape[:2]
+                inliers = mask.sum()
+                logger.info(f"   [{i+1}] 内点: {inliers}/{len(good)} ({inliers/max(1,len(good))*100:.0f}%)")
 
-                pts = np.float32([[0, 0], [0, h2], [w2, h2], [w2, 0]]).reshape(-1, 1, 2)
-                dst = cv2.perspectiveTransform(pts, H)
-                pts_all = np.concatenate((np.float32([[0, 0], [0, h1], [w1, h1], [w1, 0]]).reshape(-1, 1, 2), dst), axis=0)
-                [x_min, y_min] = np.int32(pts_all.min(axis=0).ravel() - 0.5)
-                [x_max, y_max] = np.int32(pts_all.max(axis=0).ravel() + 0.5)
+                # --- 计算画布 ---
+                corners_R = np.float32([[0, 0], [wR, 0], [wR, hR], [0, hR]]).reshape(-1, 1, 2)
+                corners_R_in_L = cv2.perspectiveTransform(corners_R, H)
+                corners_L = np.float32([[0, 0], [wL, 0], [wL, hL], [0, hL]]).reshape(-1, 1, 2)
+                all_corners = np.concatenate((corners_L, corners_R_in_L), axis=0)
 
-                # 平移变换
-                H_trans = np.array([[1, 0, -x_min], [0, 1, -y_min], [0, 0, 1]], dtype=np.float64)
-                result = cv2.warpPerspective(
-                    img_right, H_trans @ H,
-                    (x_max - x_min, y_max - y_min)
-                )
-                result[-y_min:h1 - y_min, -x_min:w1 - x_min] = result[-y_min:h1 - y_min, -x_min:w1 - x_min].copy()
+                [x_min, y_min] = np.int32(all_corners.min(axis=0).ravel() - 0.5)
+                [x_max, y_max] = np.int32(all_corners.max(axis=0).ravel() + 0.5)
+                canvas_w = x_max - x_min
+                canvas_h = y_max - y_min
 
-                warped_h = max(h1, h2) + abs(y_min)
-                warped_w = max(w1, w2) + abs(x_min)
-                # 确保画布大小
-                canvas = np.zeros((max(result.shape[0], h1), max(result.shape[1], w1), 3), dtype=np.uint8)
+                # 如果画布没有变大，说明图片几乎完全重叠
+                if canvas_w <= wL and canvas_h <= hL:
+                    logger.info(f"   [{i+1}] 图片完全重叠 (无位移)")
+                    continue
 
-                # 放左侧图
-                canvas[-min(0, y_min):h1 - min(0, y_min), -min(0, x_min):w1 - min(0, x_min)] = result[-min(0, y_min):h1 - min(0, y_min), -min(0, x_min):w1 - min(0, x_min)]
+                # --- 拼接 ---
+                T = np.array([[1, 0, -x_min], [0, 1, -y_min], [0, 0, 1]], dtype=np.float64)
 
-            logger.info(f"  特征匹配拼接完成 ({len(img_paths)} 张)")
-            return result
+                # 创建新画布
+                new_canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+
+                # 放置左图（已有拼接结果）
+                y_off = -y_min
+                x_off = -x_min
+                if y_off >= 0 and x_off >= 0 and y_off + hL <= canvas_h and x_off + wL <= canvas_w:
+                    new_canvas[y_off:y_off + hL, x_off:x_off + wL] = canvas
+
+                # 变换右图并叠加
+                warped_right = cv2.warpPerspective(img_right, T @ H, (canvas_w, canvas_h))
+                mask_right = (warped_right > 0).all(axis=2)
+                new_canvas[mask_right] = warped_right[mask_right]
+
+                canvas = new_canvas
+                logger.info(f"   -> 画布: {canvas_w}x{canvas_h}")
+
+            return canvas
 
         except Exception as e:
             logger.warning(f"  特征匹配异常: {e}")
             return None
 
-    def _save_log(self, output_dir: Path, timestamp: datetime, count: int, panorama_path: Optional[Path]):
+    # ---------- 日志 ----------
+
+    def _save_log(self, output_dir: Path, timestamp: datetime,
+                  count: int, panorama_path: Optional[Path]):
         """保存采集日志"""
         log = {
             "time": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
             "grid": f"{self.pan_steps}×{self.tilt_steps}",
             "images_captured": count,
             "panorama": str(panorama_path) if panorama_path else "failed",
-            "config": {
-                "ip": self.config.ip,
-                "model": "HK-Q3S5M-W",
+            "params": {
                 "pan_speed": self.pan_speed,
-                "tilt_speed": self.tilt_speed,
                 "step_duration": self.step_duration,
             }
         }

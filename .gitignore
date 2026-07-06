@@ -20,6 +20,9 @@ sdk/*.so
 sdk/*.lib
 !sdk/README.md
 
+# Panorama output (generated images)
+img/
+
 # OS
 Thumbs.db
 .DS_Store

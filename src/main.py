@@ -186,7 +186,6 @@ def cmd_panorama(config, pan_steps, tilt_steps, speed, step_duration):
         pan_steps=pan_steps,
         tilt_steps=tilt_steps,
         pan_speed=speed,
-        tilt_speed=max(20, speed - 10),
         step_duration=step_duration,
     )
     try:
@@ -221,7 +220,6 @@ def cmd_auto(config, interval, pan_steps, tilt_steps, speed, step_duration):
         pan_steps=pan_steps,
         tilt_steps=tilt_steps,
         pan_speed=speed,
-        tilt_speed=max(20, speed - 10),
         step_duration=step_duration,
     )
     try:
@@ -275,12 +273,12 @@ def main():
     parser.add_argument("--auto", action="store_true", help="自动循环全景图采集")
     parser.add_argument("--interval", type=int, default=5,
                         help="自动采集间隔（分钟，默认 5）")
-    parser.add_argument("--pan-steps", type=int, default=5,
-                        help="水平方向步数（默认 5）")
-    parser.add_argument("--tilt-steps", type=int, default=2,
-                        help="垂直方向行数（默认 2）")
-    parser.add_argument("--step-duration", type=float, default=2.5,
-                        help="每步移动秒数（默认 2.5）")
+    parser.add_argument("--pan-steps", type=int, default=8,
+                        help="水平方向步数（默认 8，覆盖全角度）")
+    parser.add_argument("--tilt-steps", type=int, default=3,
+                        help="垂直方向行数（默认 3）")
+    parser.add_argument("--step-duration", type=float, default=8.0,
+                        help="每步移动秒数（默认 8.0，越大覆盖角度越广）")
 
     args = parser.parse_args()
 
