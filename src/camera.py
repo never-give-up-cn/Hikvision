@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 摄像头连接与数据获取模块
 
@@ -121,12 +122,13 @@ class CameraConnection:
                 # 解析设备信息
                 import xml.etree.ElementTree as ET
                 root = ET.fromstring(resp.content)
+                ns = {"hk": "http://www.hikvision.com/ver20/XMLSchema"}
                 self._device_info = {
-                    "device_name": root.findtext(".//deviceName", ""),
-                    "device_id": root.findtext(".//deviceID", ""),
-                    "model": root.findtext(".//model", ""),
-                    "serial": root.findtext(".//serialNumber", ""),
-                    "firmware": root.findtext(".//firmwareVersion", ""),
+                    "device_name": root.findtext("hk:deviceName", "", ns),
+                    "device_id": root.findtext("hk:deviceID", "", ns),
+                    "model": root.findtext("hk:model", "", ns),
+                    "serial": root.findtext("hk:serialNumber", "", ns),
+                    "firmware": root.findtext("hk:firmwareVersion", "", ns),
                 }
                 return True
             else:

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 海康威视 HCNetSDK DLL 包装器
 

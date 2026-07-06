@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 主入口 - 海康威视 PTZ 摄像头控制程序
 

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 PTZ 云台控制模块
 
@@ -40,13 +41,13 @@ class PTZController:
     def __init__(self, config: CameraConfig):
         self.config = config
         self.client = ISAPIClient(config)
-        self._default_speed = config.get_ptz_speed() / 100.0  # 转为 0-1 范围
+        self._default_speed = config.get_ptz_speed()
 
-    def _normalize_speed(self, speed: Optional[int]) -> float:
-        """将 1-100 的速度转为 ISAPI 的 0-1 范围"""
+    def _clamp_speed(self, speed: Optional[int]) -> int:
+        """限制速度范围在 1-100"""
         if speed is None:
             return self._default_speed
-        return max(0.01, min(1.0, speed / 100.0))
+        return max(1, min(100, int(speed)))
 
     def move(self, direction: PTZDirection, speed: Optional[int] = None,
              duration_ms: int = 0) -> bool:
@@ -61,7 +62,7 @@ class PTZController:
         Returns:
             bool: 是否成功
         """
-        s = self._normalize_speed(speed)
+        s = self._clamp_speed(speed)
         moves = {
             PTZDirection.UP:        lambda: self.client.ptz_move_up(s),
             PTZDirection.DOWN:      lambda: self.client.ptz_move_down(s),
@@ -101,7 +102,7 @@ class PTZController:
         Returns:
             bool: 是否成功
         """
-        s = self._normalize_speed(speed)
+        s = self._clamp_speed(speed)
         actions = {
             PTZAction.ZOOM_IN:    lambda: self.client.ptz_zoom_in(s),
             PTZAction.ZOOM_OUT:   lambda: self.client.ptz_zoom_out(s),
@@ -148,7 +149,7 @@ class PTZController:
 
         每步约 200ms，适用于精确定位
         """
-        s = self._normalize_speed(speed)
+        s = self._clamp_speed(speed)
         for _ in range(steps):
             success = self.move(direction, speed=int(s * 100), duration_ms=200)
             if not success:

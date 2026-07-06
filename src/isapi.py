@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 ISAPI 协议实现模块
 
@@ -76,19 +77,19 @@ class ISAPIClient:
 
     # ========== PTZ 云台控制 ==========
 
-    def ptz_continuous_move(self, pan: float = 0, tilt: float = 0,
-                            zoom: float = 0) -> bool:
+    def ptz_continuous_move(self, pan: int = 0, tilt: int = 0,
+                            zoom: int = 0) -> bool:
         """
         云台连续运动控制
 
-        参数范围（ISAPI 标准）:
-          pan:   -1.0 (左)  ~ 1.0 (右)
-          tilt:  -1.0 (下)  ~ 1.0 (上)
-          zoom:  -1.0 (缩)  ~ 1.0 (放)
+        参数范围（海康 ISAPI 实际范围）:
+          pan:   -100 (左)  ~ 100 (右)
+          tilt:  -100 (下)  ~ 100 (上)
+          zoom:  -100 (缩)  ~ 100 (放)
 
-        注意: 海康摄像头 pan/tilt 符号与标准可能不同
+        注意: 值为 0 表示停止该方向运动
         """
-        xml = PTZ_CONTINUOUS_XML.format(pan=pan, tilt=tilt, zoom=zoom)
+        xml = PTZ_CONTINUOUS_XML.format(pan=int(pan), tilt=int(tilt), zoom=int(zoom))
         path = f"/ISAPI/PTZCtrl/channels/{self.channel}/continuous"
         resp = self._request("PUT", path, data=xml)
         return self._check_response(resp)
@@ -97,43 +98,43 @@ class ISAPIClient:
         """停止云台运动"""
         return self.ptz_continuous_move(pan=0, tilt=0, zoom=0)
 
-    def ptz_move_up(self, speed: float = 0.5) -> bool:
-        """云台上仰"""
+    def ptz_move_up(self, speed: int = 30) -> bool:
+        """云台上仰 (speed: 1-100)"""
         return self.ptz_continuous_move(tilt=speed)
 
-    def ptz_move_down(self, speed: float = 0.5) -> bool:
-        """云台下俯"""
+    def ptz_move_down(self, speed: int = 30) -> bool:
+        """云台下俯 (speed: 1-100)"""
         return self.ptz_continuous_move(tilt=-speed)
 
-    def ptz_move_left(self, speed: float = 0.5) -> bool:
-        """云台左转"""
+    def ptz_move_left(self, speed: int = 30) -> bool:
+        """云台左转 (speed: 1-100)"""
         return self.ptz_continuous_move(pan=-speed)
 
-    def ptz_move_right(self, speed: float = 0.5) -> bool:
-        """云台右转"""
+    def ptz_move_right(self, speed: int = 30) -> bool:
+        """云台右转 (speed: 1-100)"""
         return self.ptz_continuous_move(pan=speed)
 
-    def ptz_move_upleft(self, pan_speed: float = 0.5, tilt_speed: float = 0.5) -> bool:
+    def ptz_move_upleft(self, pan_speed: int = 30, tilt_speed: int = 30) -> bool:
         """云台左上"""
         return self.ptz_continuous_move(pan=-pan_speed, tilt=tilt_speed)
 
-    def ptz_move_upright(self, pan_speed: float = 0.5, tilt_speed: float = 0.5) -> bool:
+    def ptz_move_upright(self, pan_speed: int = 30, tilt_speed: int = 30) -> bool:
         """云台右上"""
         return self.ptz_continuous_move(pan=pan_speed, tilt=tilt_speed)
 
-    def ptz_move_downleft(self, pan_speed: float = 0.5, tilt_speed: float = 0.5) -> bool:
+    def ptz_move_downleft(self, pan_speed: int = 30, tilt_speed: int = 30) -> bool:
         """云台左下"""
         return self.ptz_continuous_move(pan=-pan_speed, tilt=-tilt_speed)
 
-    def ptz_move_downright(self, pan_speed: float = 0.5, tilt_speed: float = 0.5) -> bool:
+    def ptz_move_downright(self, pan_speed: int = 30, tilt_speed: int = 30) -> bool:
         """云台右下"""
         return self.ptz_continuous_move(pan=pan_speed, tilt=-tilt_speed)
 
-    def ptz_zoom_in(self, speed: float = 0.5) -> bool:
+    def ptz_zoom_in(self, speed: int = 30) -> bool:
         """变倍放大"""
         return self.ptz_continuous_move(zoom=speed)
 
-    def ptz_zoom_out(self, speed: float = 0.5) -> bool:
+    def ptz_zoom_out(self, speed: int = 30) -> bool:
         """变倍缩小"""
         return self.ptz_continuous_move(zoom=-speed)
 
@@ -214,11 +215,13 @@ class ISAPIClient:
         if resp.status_code != 200:
             return {}
         root = ET.fromstring(resp.content)
+        # 处理 Hikvision XML 命名空间
+        ns = {"hk": "http://www.hikvision.com/ver20/XMLSchema"}
         return {
-            "device_name": root.findtext("deviceName", ""),
-            "device_id": root.findtext("deviceID", ""),
-            "model": root.findtext("model", ""),
-            "serial": root.findtext("serialNumber", ""),
-            "firmware": root.findtext("firmwareVersion", ""),
-            "mac": root.findtext("macAddress", ""),
+            "device_name": root.findtext("hk:deviceName", "", ns),
+            "device_id": root.findtext("hk:deviceID", "", ns),
+            "model": root.findtext("hk:model", "", ns),
+            "serial": root.findtext("hk:serialNumber", "", ns),
+            "firmware": root.findtext("hk:firmwareVersion", "", ns),
+            "mac": root.findtext("hk:macAddress", "", ns),
         }
