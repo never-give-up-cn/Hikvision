@@ -78,6 +78,17 @@ python src/main.py --status
 
 # 抓拍
 python src/main.py --snapshot output.jpg
+
+# 全景图采集
+python src/main.py --panorama                             # 单次采集（5列×2行）
+python src/main.py --panorama --pan-steps 6 --tilt-steps 3  # 自定义网格
+python src/main.py --auto --interval 5                      # 每5分钟自动采集一次
+
+# 全景图输出目录
+# img/YYYY-MM-DD/HHMMSS/
+# ├── r1_c1.jpg ~ rN_cM.jpg   各位置原始抓拍
+# ├── panorama.jpg             拼接后的全景图
+# └── capture_log.json         采集日志
 ```
 
 ## ISAPI 协议说明
@@ -98,3 +109,4 @@ python src/main.py --snapshot output.jpg
 |------|------|----------|
 | v0.1 | 2026-07-06 | 项目初始化：创建工程结构，实现 ISAPI 协议 PTZ 云台控制（上下左右、变倍、聚焦、预置位），摄像头配置管理 |
 | v0.11 | 2026-07-06 | 修复：修正摄像头用户名（root→admin）、端口（8000→80）、ISAPI 数值范围（0-1→0-100），修复 XML 命名空间解析，实际摄像头 PTZ 调通 |
+| v0.12 | 2026-07-06 | 新增全景图采集：PTZ 自动遍历网格（Z 字形），逐位抓拍，OpenCV 拼接全景图（Stitcher + 特征匹配双模式），输出到 img/日期/时间/ 目录，支持 --auto 自动循环采集，抓拍通道修复（102→JPEG） |

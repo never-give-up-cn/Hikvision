@@ -24,11 +24,18 @@
 
   # 设备信息
   python src/main.py --info
+
+  # 全景图采集（单次）
+  python src/main.py --panorama
+
+  # 全景图自动循环（每5分钟）
+  python src/main.py --auto --interval 5
 """
 
 import sys
 import os
 import argparse
+import logging
 from pathlib import Path
 
 # 确保 src 目录在 path 中
@@ -37,6 +44,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.camera import CameraConfig
 from src.isapi import ISAPIClient, ISAPIError
 from src.ptz import PTZController, PTZDirection, PTZAction
+from src.panorama import PanoramaCapture
 
 
 def cmd_status(client: ISAPIClient):
@@ -163,9 +171,71 @@ def cmd_snapshot(client: ISAPIClient, output: str):
         return 1
 
 
+def cmd_panorama(config, pan_steps, tilt_steps, speed, step_duration):
+    """单次全景图采集"""
+    print("\n=== 全景图采集 ===")
+    print(f"网格: {pan_steps}列 × {tilt_steps}行 ({pan_steps * tilt_steps}张)")
+    print(f"速度: {speed}  步长: {step_duration}s")
+    print("开始采集（按 Ctrl+C 停止）...\n")
+
+    # 配置日志
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+    pano = PanoramaCapture(
+        config,
+        pan_steps=pan_steps,
+        tilt_steps=tilt_steps,
+        pan_speed=speed,
+        tilt_speed=max(20, speed - 10),
+        step_duration=step_duration,
+    )
+    try:
+        result = pano.capture()
+        if result:
+            print(f"\n[OK] 全景图已生成: {result}")
+            return 0
+        else:
+            print("\n[FAIL] 全景图采集失败")
+            return 1
+    except KeyboardInterrupt:
+        print("\n用户中断")
+        pano.stop()
+        return 0
+
+
+def cmd_auto(config, interval, pan_steps, tilt_steps, speed, step_duration):
+    """自动循环全景图采集"""
+    print(f"\n=== 自动全景图模式 ===")
+    print(f"间隔: {interval} 分钟")
+    print(f"网格: {pan_steps}列 × {tilt_steps}行")
+    print("按 Ctrl+C 停止\n")
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    pano = PanoramaCapture(
+        config,
+        pan_steps=pan_steps,
+        tilt_steps=tilt_steps,
+        pan_speed=speed,
+        tilt_speed=max(20, speed - 10),
+        step_duration=step_duration,
+    )
+    try:
+        pano.auto_loop(interval_minutes=interval)
+        return 0
+    except KeyboardInterrupt:
+        print("\n用户中断")
+        pano.stop()
+        return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="海康威视 PTZ 摄像头控制程序 v0.1",
+        description="海康威视 PTZ 摄像头控制程序 v0.12",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
@@ -176,6 +246,11 @@ def main():
   %(prog)s --preset set --id 1   设置预置位 1
   %(prog)s --preset goto --id 1  转到预置位 1
   %(prog)s --snapshot out.jpg    抓拍
+
+  # 全景图
+  %(prog)s --panorama            单次全景图采集（6x2=12张）
+  %(prog)s --panorama --pan-steps 8 --tilt-steps 3  自定义网格
+  %(prog)s --auto --interval 5   每5分钟自动采集全景图
         """
     )
 
@@ -194,6 +269,18 @@ def main():
     parser.add_argument("--name", type=str, default="", help="预置位名称")
 
     parser.add_argument("--snapshot", metavar="FILE", help="抓拍并保存到文件")
+
+    # 全景图参数
+    parser.add_argument("--panorama", action="store_true", help="单次全景图采集")
+    parser.add_argument("--auto", action="store_true", help="自动循环全景图采集")
+    parser.add_argument("--interval", type=int, default=5,
+                        help="自动采集间隔（分钟，默认 5）")
+    parser.add_argument("--pan-steps", type=int, default=5,
+                        help="水平方向步数（默认 5）")
+    parser.add_argument("--tilt-steps", type=int, default=2,
+                        help="垂直方向行数（默认 2）")
+    parser.add_argument("--step-duration", type=float, default=2.5,
+                        help="每步移动秒数（默认 2.5）")
 
     args = parser.parse_args()
 
@@ -232,6 +319,12 @@ def main():
 
         if args.snapshot:
             return cmd_snapshot(client, args.snapshot)
+
+        if args.panorama:
+            return cmd_panorama(config, args.pan_steps, args.tilt_steps, args.speed, args.step_duration)
+
+        if args.auto:
+            return cmd_auto(config, args.interval, args.pan_steps, args.tilt_steps, args.speed, args.step_duration)
 
     except ISAPIError as e:
         print(f"[FAIL] ISAPI 错误: {e}")

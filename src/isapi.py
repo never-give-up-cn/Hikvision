@@ -202,11 +202,29 @@ class ISAPIClient:
     # ========== 图像获取 ==========
 
     def get_snapshot(self) -> Optional[bytes]:
-        """获取当前画面快照（JPEG）"""
-        path = f"/ISAPI/Streaming/channels/{self.channel}/picture"
-        resp = self._request("GET", path, timeout=10)
-        if resp.status_code == 200 and resp.content:
-            return resp.content
+        """
+        获取当前画面快照（JPEG）
+
+        尝试多个通道号（1, 101），某些相机主码流为 101
+        """
+        channels_to_try = [102, self.channel, 101, 1]
+
+        # 检查内容是否是 XML 错误
+        def is_error_xml(data: bytes) -> bool:
+            return data[:5] in (b'<?xml', b'<Resp')
+
+        for ch in channels_to_try:
+            try:
+                path = f"/ISAPI/Streaming/channels/{ch}/picture"
+                resp = self._request("GET", path, timeout=10)
+                if resp.status_code == 200 and resp.content and not is_error_xml(resp.content):
+                    return resp.content
+                if resp.status_code == 503:
+                    # 设备繁忙，不继续尝试其他通道
+                    return None
+            except Exception:
+                continue
+
         return None
 
     def get_device_info(self) -> dict:
