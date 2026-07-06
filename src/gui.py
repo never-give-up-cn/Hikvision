@@ -43,7 +43,7 @@ class PanoramaApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("海康威视 PTZ 全景图管理 v0.13")
+        self.title("海康威视 PTZ 全角度拍照采集 v0.15")
         self.geometry(f"{WINDOW_W}x{WINDOW_H}")
         self.minsize(1024, 600)
 
@@ -64,8 +64,8 @@ class PanoramaApp(ctk.CTk):
         self.tab_view.pack(fill="both", expand=True, padx=8, pady=8)
 
         # 创建两个菜单页
-        self.tab_live = self.tab_view.add("全景合成实况")
-        self.tab_history = self.tab_view.add("合成历史查看")
+        self.tab_live = self.tab_view.add("全角度拍照")
+        self.tab_history = self.tab_view.add("采集历史查看")
 
         # 初始化各页面
         self._setup_live_tab()
@@ -79,7 +79,7 @@ class PanoramaApp(ctk.CTk):
     # ────────────── 菜单1: 全景合成实况 ──────────────
 
     def _setup_live_tab(self):
-        """布局「全景合成实况」页面"""
+        """布局「全角度拍照」页面"""
         # 左侧: 状态 + 控制 + 日志
         left = ctk.CTkFrame(self.tab_live, width=380)
         left.pack(side="left", fill="y", padx=(0, 8))
@@ -100,10 +100,15 @@ class PanoramaApp(ctk.CTk):
                                        text_color="gray")
         self.lbl_status.pack(anchor="w", padx=8)
 
+        self.lbl_progress = ctk.CTkLabel(status_frame, text="采集进度: 0/0",
+                                         font=("", 16, "bold"),
+                                         text_color="#FFD700")
+        self.lbl_progress.pack(anchor="w", padx=8, pady=2)
+
         self.lbl_last = ctk.CTkLabel(status_frame, text="上次: -")
         self.lbl_last.pack(anchor="w", padx=8, pady=(0, 5))
 
-        self.progress = ctk.CTkProgressBar(status_frame, mode="indeterminate")
+        self.progress = ctk.CTkProgressBar(status_frame, mode="determinate")
         self.progress.pack(fill="x", padx=8, pady=5)
         self.progress.pack_forget()  # 隐藏
 
@@ -138,7 +143,7 @@ class PanoramaApp(ctk.CTk):
         right = ctk.CTkFrame(self.tab_live)
         right.pack(side="right", fill="both", expand=True)
 
-        ctk.CTkLabel(right, text="实时预览", font=("", 14, "bold")
+        ctk.CTkLabel(right, text="最新抓拍预览", font=("", 14, "bold")
                      ).pack(anchor="n", padx=10, pady=(10, 5))
 
         # 图片预览区域
@@ -210,8 +215,8 @@ class PanoramaApp(ctk.CTk):
         self._stop_worker = False
         self.btn_start.configure(state="disabled")
         self.btn_stop.configure(state="normal")
-        self.progress.pack(fill="x", padx=8, pady=5)
-        self.progress.start()
+        self.lbl_progress.configure(text="采集进度: 0/0")
+        self.progress.set(0)
         self.lbl_status.configure(text="状态: 采集中...", text_color="orange")
         self.lbl_preview.configure(image="", text="采集中...")
 
@@ -227,10 +232,10 @@ class PanoramaApp(ctk.CTk):
     # ────────────── 工作线程 ──────────────
 
     def _worker_run(self):
-        """工作线程：运行全景图采集"""
-        pano = None
+        """工作线程：运行全角度拍照采集"""
+        capture = None
         try:
-            pano = PanoramaCapture(
+            capture = PanoramaCapture(
                 self.config,
                 callback=self._worker_callback,
                 pan_steps=8,
@@ -238,16 +243,19 @@ class PanoramaApp(ctk.CTk):
                 pan_speed=100,
                 step_duration=8.0,
             )
-            pano.capture()
+            result = capture.capture()
+            if result is None:
+                self._put_queue("log", "采集失败（无返回结果）")
+                self._put_queue("done", failed=True)
         except Exception as e:
             self._put_queue("log", f"[ERROR] {e}")
+            self._put_queue("done", failed=True)
         finally:
-            if pano:
+            if capture:
                 try:
-                    pano.stop()
+                    capture.stop()
                 except Exception:
                     pass
-            self._put_queue("done")
 
     def _worker_callback(self, msg: dict):
         """工作线程的回调 -> 放入队列传给 GUI 线程"""
@@ -256,8 +264,12 @@ class PanoramaApp(ctk.CTk):
             self._put_queue("log", msg.get("msg", ""))
         elif msg_type == "capture":
             self._put_queue("capture", msg.get("path", ""), msg.get("label", ""))
+        elif msg_type == "progress":
+            self._put_queue("progress", msg.get("current", 0), msg.get("total", 0))
         elif msg_type == "panorama":
             self._put_queue("panorama", msg.get("path", ""))
+        elif msg_type == "done":
+            self._put_queue("done", msg.get("path", ""), msg.get("count", 0))
         elif msg_type == "status":
             self._put_queue("status", msg.get("msg", ""))
 
@@ -288,6 +300,13 @@ class PanoramaApp(ctk.CTk):
         if type_ == "log":
             self._log(msg[1] if len(msg) > 1 else "")
 
+        elif type_ == "progress":
+            cur = msg[1] if len(msg) > 1 else 0
+            tot = msg[2] if len(msg) > 2 else 0
+            self.lbl_progress.configure(text=f"采集进度: {cur}/{tot}")
+            if tot > 0:
+                self.progress.set(cur / tot)
+
         elif type_ == "capture":
             path = msg[1] if len(msg) > 1 else ""
             label = msg[2] if len(msg) > 2 else ""
@@ -303,15 +322,19 @@ class PanoramaApp(ctk.CTk):
             self.lbl_status.configure(text=f"状态: {status}")
 
         elif type_ == "done":
-            self._on_worker_done()
+            out_path = msg[1] if len(msg) > 1 else ""
+            count = msg[2] if len(msg) > 2 else 0
+            self._on_worker_done(out_path, count)
 
-    def _on_worker_done(self):
+    def _on_worker_done(self, output_path="", count=0):
         """工作线程结束"""
         self.btn_start.configure(state="normal")
         self.btn_stop.configure(state="disabled")
-        self.progress.stop()
-        self.progress.pack_forget()
-        self.lbl_status.configure(text="状态: 空闲", text_color="gray")
+        if count:
+            self.lbl_status.configure(text=f"状态: ✓ 采集完成 ({count}张)", text_color="green")
+            self.lbl_preview.configure(text=f"✅ 完成! {count} 张图片已保存\n{output_path}", image="")
+        else:
+            self.lbl_status.configure(text="状态: 空闲", text_color="gray")
         self._scan_history()
 
     # ────────────── GUI 更新方法 ──────────────

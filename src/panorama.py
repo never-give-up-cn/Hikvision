@@ -95,10 +95,10 @@ class PanoramaCapture:
 
     def capture(self) -> Optional[Path]:
         """
-        执行一次完整的全角度全景图采集
+        全角度拍照采集：旋转到每个角度并拍照，不拼接
 
         Returns:
-          全景图文件路径，失败返回 None
+          输出目录路径（包含所有抓拍图片），失败返回 None
         """
         self._stop_flag = False
         timestamp = datetime.now()
@@ -109,14 +109,14 @@ class PanoramaCapture:
 
         total_images = self.pan_steps * self.tilt_steps
         estimated_time = (
-            self._calibrate_duration * 2  # 移动到左上极限
-            + self.pan_steps * self.step_duration * self.tilt_steps  # 水平移动
-            + (self.tilt_steps - 1) * self.step_duration * 1.5  # 垂直移动
-            + total_images * (0.5 + self.settle_time)  # 抓拍耗时
+            self._calibrate_duration * 2
+            + self.pan_steps * self.step_duration * self.tilt_steps
+            + (self.tilt_steps - 1) * self.step_duration * 1.5
+            + total_images * (0.5 + self.settle_time)
         )
 
         logger.info("=" * 55)
-        logger.info(f"  全角度全景图采集")
+        logger.info(f"  全角度拍照采集")
         logger.info(f"  网格: {self.pan_steps}列 × {self.tilt_steps}行 = {total_images}张")
         logger.info(f"  速度: {self.pan_speed}  每步: {self.step_duration}s")
         logger.info(f"  预计耗时: {estimated_time:.0f}s ({estimated_time/60:.1f}min)")
@@ -137,15 +137,15 @@ class PanoramaCapture:
             return None
 
         logger.info(f"\n采集完成: {len(images)} 张有效图片")
-        self._cb("status", msg=f"采集完成: {len(images)} 张, 正在拼接...")
+        self._cb("status", msg=f"采集完成: {len(images)} 张")
 
-        # 2. 拼接全景图
-        panorama_path = self._stitch_and_save(images, output_dir, timestamp)
+        # 2. 保存日志
+        self._save_log(output_dir, timestamp, len(images), None)
 
-        # 3. 保存日志
-        self._save_log(output_dir, timestamp, len(images), panorama_path)
+        # 3. 通知完成
+        self._cb("done", path=str(output_dir), count=len(images))
 
-        return panorama_path
+        return output_dir
 
     def auto_loop(self, interval_minutes: int = 5):
         """自动循环模式"""
@@ -216,6 +216,9 @@ class PanoramaCapture:
         logger.info("[校准] 到位")
 
         # === 阶段2: Z字形网格扫描 ===
+        total_captures = self.pan_steps * self.tilt_steps
+        capture_index = 0
+
         for tilt_idx in range(self.tilt_steps):
             if self._stop_flag:
                 return images
@@ -249,8 +252,10 @@ class PanoramaCapture:
                 if self._stop_flag:
                     return images
 
+                capture_index += 1
                 img_path = output_dir / f"{pos_label}.jpg"
                 label = f"[{pos_label}]"
+                self._cb("progress", current=capture_index, total=total_captures)
                 success = self._capture_single(img_path, label=label)
                 if success:
                     images.append((pos_label, img_path))
