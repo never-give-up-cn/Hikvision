@@ -231,7 +231,7 @@ class PanoramaApp(ctk.CTk):
         ctk.CTkLabel(left, text="灵敏度", font=("", 12)).pack(
             anchor="w", padx=10, pady=(10, 0))
         self.slider_sensitivity = ctk.CTkSlider(
-            left, from_=1, to_=10, number_of_steps=9)
+            left, from_=1, to=10, number_of_steps=9)
         self.slider_sensitivity.set(5)
         self.slider_sensitivity.pack(fill="x", padx=10, pady=2)
         self.lbl_sens_value = ctk.CTkLabel(left, text="5", font=("", 11))
@@ -244,7 +244,7 @@ class PanoramaApp(ctk.CTk):
         ctk.CTkLabel(left, text="通知冷却（秒）", font=("", 12)).pack(
             anchor="w", padx=10, pady=(10, 0))
         self.slider_cooldown = ctk.CTkSlider(
-            left, from_=10, to_=120, number_of_steps=11)
+            left, from_=10, to=120, number_of_steps=11)
         self.slider_cooldown.set(30)
         self.slider_cooldown.pack(fill="x", padx=10, pady=2)
         self.lbl_cd_value = ctk.CTkLabel(left, text="30s", font=("", 11))
@@ -305,6 +305,13 @@ class PanoramaApp(ctk.CTk):
         cooldown = int(self.slider_cooldown.get())
         min_area = {1: 8000, 3: 5000, 5: 3000, 7: 1500, 10: 500}.get(sensitivity, 3000)
 
+        def on_frame(jpeg_data, ts):
+            """帧回调：放入队列更新预览"""
+            try:
+                self.gui_queue.put_nowait(("motion_frame", jpeg_data, ts))
+            except Exception:
+                pass
+
         self.motion_detector = MotionDetector(
             self.config,
             interval=0.5,
@@ -312,6 +319,7 @@ class PanoramaApp(ctk.CTk):
             cooldown=cooldown,
             sensitivity=sensitivity,
             callback=self._on_motion_alert,
+            frame_callback=on_frame,
         )
 
         self.motion_detector.start()
@@ -462,6 +470,20 @@ class PanoramaApp(ctk.CTk):
         elif type_ == "status":
             status = msg[1] if len(msg) > 1 else ""
             self.lbl_status.configure(text=f"状态: {status}")
+
+        elif type_ == "motion_frame":
+            jpeg_data = msg[1]
+            try:
+                from PIL import Image
+                import io
+                pil_img = Image.open(io.BytesIO(jpeg_data))
+                max_w, max_h = 500, 360
+                pil_img.thumbnail((max_w, max_h), Image.LANCZOS)
+                ctk_img = ctk.CTkImage(pil_img, size=pil_img.size)
+                self.lbl_motion_preview.configure(image=ctk_img, text="")
+                self.lbl_motion_preview.image = ctk_img
+            except Exception:
+                pass
 
         elif type_ == "motion_alert":
             info = msg[1] if len(msg) > 1 else {}

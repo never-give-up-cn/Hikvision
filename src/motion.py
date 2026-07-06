@@ -94,7 +94,13 @@ class MotionDetector:
         cooldown: float = 30.0,
         sensitivity: int = 5,
         callback: Optional[Callable] = None,
+        frame_callback: Optional[Callable] = None,
     ):
+        """
+        Args:
+            frame_callback: 每帧回调，用于 GUI 实时预览
+                            frame_callback(jpeg_bytes, timestamp)
+        """
         self.config = config
         self.isapi = ISAPIClient(config)
         self.interval = max(0.2, min(5.0, interval))
@@ -102,6 +108,7 @@ class MotionDetector:
         self.min_aspect = min_aspect
         self.cooldown = max(5.0, cooldown)
         self.callback = callback
+        self.frame_callback = frame_callback
 
         # 灵敏度映射 (1-10 → 学习率 0.01-0.001)
         self._learning_rate = max(0.001, min(0.01, 0.011 - sensitivity * 0.001))
@@ -188,7 +195,13 @@ class MotionDetector:
                 if detected:
                     self._on_detected(frame, img_data)
 
-                # 保存最后一帧（供 GUI 预览）
+                # 实时预览回调（每 3 帧一次给 GUI）
+                if self.frame_callback and self._frame_count % 3 == 0:
+                    try:
+                        self.frame_callback(img_data, datetime.now())
+                    except Exception:
+                        pass
+
                 self._last_frame = frame
 
             except Exception as e:
