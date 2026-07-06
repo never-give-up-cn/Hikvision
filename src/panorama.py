@@ -218,6 +218,8 @@ class PanoramaCapture:
         # === 阶段2: Z字形网格扫描 ===
         total_captures = self.pan_steps * self.tilt_steps
         capture_index = 0
+        prev_img_data = None  # 上一张图的像素数据，用于死限检测
+        DEADZONE_THRESHOLD = 5.0  # 平均像素差 < 此值视为撞到死限
 
         for tilt_idx in range(self.tilt_steps):
             if self._stop_flag:
@@ -225,6 +227,7 @@ class PanoramaCapture:
 
             row_dir = 1 if tilt_idx % 2 == 0 else -1  # 偶数行→右, 奇数行→左
             col_range = range(self.pan_steps) if row_dir == 1 else range(self.pan_steps - 1, -1, -1)
+            hit_deadzone = False  # 本行是否已撞死限
 
             logger.info(f"\n--- 第 {tilt_idx + 1}/{self.tilt_steps} 行 {'→' if row_dir == 1 else '←'} ---")
 
@@ -236,16 +239,39 @@ class PanoramaCapture:
 
             # 扫描本行各列
             for col_idx in col_range:
-                if self._stop_flag:
+                if self._stop_flag or hit_deadzone:
                     return images
 
                 pos_label = f"r{tilt_idx + 1}_c{col_idx + 1}"
 
                 # 非本行第一列: 水平移动
                 if col_idx != col_range[0]:
-                    # 偶数行→右, 奇数行←左
                     pan_val = self.pan_speed if row_dir == 1 else -self.pan_speed
                     self._move_by_continuous(pan=pan_val, tilt=0, duration=self.step_duration)
+
+                    # ── 死限检测: 移动后快速比较图片是否变化 ──
+                    if prev_img_data is not None:
+                        check_data = self._quick_snapshot()
+                        if check_data and self._images_similar(prev_img_data, check_data, DEADZONE_THRESHOLD):
+                            logger.warning(f"  [死限] 转到极限了！跳过本行剩余位置")
+                            self._cb("status", msg=f"第 {tilt_idx+1} 行撞到死限，跳过")
+                            hit_deadzone = True
+                            # 把剩余位置的计数补上
+                            remaining = len(col_range) - col_range.index(col_idx) - 1
+                            for skip_idx in range(remaining):
+                                capture_index += 1
+                                self._cb("progress", current=capture_index, total=total_captures)
+                            # 补上空文件
+                            for skip_col in list(col_range)[col_range.index(col_idx) + 1:]:
+                                skip_label = f"r{tilt_idx + 1}_c{skip_col + 1}"
+                                skip_path = output_dir / f"{skip_label}.jpg"
+                                # 复制最后一张有效图作为占位
+                                if images:
+                                    import shutil
+                                    shutil.copy(str(images[-1][1]), str(skip_path))
+                                    images.append((skip_label, skip_path))
+                            break
+
                     time.sleep(self.settle_time)
 
                 # 抓拍
@@ -259,6 +285,12 @@ class PanoramaCapture:
                 success = self._capture_single(img_path, label=label)
                 if success:
                     images.append((pos_label, img_path))
+                    # 保存像素数据用于死限检测
+                    try:
+                        with open(img_path, "rb") as f:
+                            prev_img_data = f.read()
+                    except Exception:
+                        pass
                 else:
                     logger.warning(f"  {label} 采集失败")
 
@@ -289,6 +321,41 @@ class PanoramaCapture:
                 remaining -= chunk
             if not self._stop_flag:
                 self.ptz.stop()
+
+    # ---------- 死限检测 ----------
+
+    def _quick_snapshot(self) -> Optional[bytes]:
+        """快速抓拍一张用于比较（无保存、无重试）"""
+        try:
+            return self.isapi.get_snapshot()
+        except Exception:
+            return None
+
+    def _images_similar(self, img_a: bytes, img_b: bytes, threshold: float = 5.0) -> bool:
+        """
+        判断两张图片是否相似（平均像素差 < threshold）
+        用于检测摄像头是否撞到死限
+
+        Returns:
+            True = 图片相似 → 可能撞死限了
+        """
+        try:
+            import cv2, numpy as np
+            if len(img_a) < 100 or len(img_b) < 100:
+                return False
+
+            # 解码并缩放到小尺寸加速比较
+            a = cv2.imdecode(np.frombuffer(img_a, np.uint8), cv2.IMREAD_GRAYSCALE)
+            b = cv2.imdecode(np.frombuffer(img_b, np.uint8), cv2.IMREAD_GRAYSCALE)
+            if a is None or b is None:
+                return False
+
+            a_small = cv2.resize(a, (64, 48))
+            b_small = cv2.resize(b, (64, 48))
+            diff = np.abs(a_small.astype(int) - b_small.astype(int)).mean()
+            return diff < threshold
+        except Exception:
+            return False
 
     # ---------- 抓拍 ----------
 
