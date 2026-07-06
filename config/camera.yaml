@@ -1,0 +1,28 @@
+# 海康威视 PTZ 摄像头配置
+# 复制此文件为 camera.local.yaml 并填入实际地址
+
+camera:
+  ip: 192.168.1.8
+  port: 8000
+  username: root
+  password: "987654321hh"
+
+  # 通道号（通常为 1）
+  channel: 1
+
+  # 协议类型: isapi（默认）| sdk
+  protocol: isapi
+
+  # 视频流参数
+  stream:
+    # 主码流: main, 子码流: sub
+    type: main
+    # 协议: H264 / H265
+    codec: H264
+
+# PTZ 参数
+ptz:
+  # 云台速度 (1-100)
+  speed: 50
+  # 运动步长 (1-100)，预置位调用时忽略
+  step: 10

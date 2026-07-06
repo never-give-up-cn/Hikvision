@@ -1,0 +1,3 @@
+[submodule "ref/hikvision"]
+	path = ref/hikvision
+	url = https://github.com/never-give-up-cn/Hikvision.git

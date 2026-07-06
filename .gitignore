@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# SDK DLLs
+sdk/*.dll
+sdk/*.so
+sdk/*.lib
+!sdk/README.md
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Config with secrets (use template instead)
+config/camera.local.yaml
+
+# Logs
+*.log
+logs/
