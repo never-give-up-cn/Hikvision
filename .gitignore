@@ -23,6 +23,9 @@ sdk/*.lib
 # Panorama output (generated images)
 img/
 
+# Motion detection snapshots
+captures/
+
 # OS
 Thumbs.db
 .DS_Store

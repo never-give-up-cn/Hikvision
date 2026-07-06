@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.camera import CameraConfig
 from src.panorama import PanoramaCapture
+from src.motion import MotionDetector
 
 # ── 主题设置 ──
 ctk.set_appearance_mode("dark")
@@ -66,10 +67,15 @@ class PanoramaApp(ctk.CTk):
         # 创建两个菜单页
         self.tab_live = self.tab_view.add("全角度拍照")
         self.tab_history = self.tab_view.add("采集历史查看")
+        self.tab_motion = self.tab_view.add("移动侦测")
+
+        # 移动侦测器
+        self.motion_detector: Optional[MotionDetector] = None
 
         # 初始化各页面
         self._setup_live_tab()
         self._setup_history_tab()
+        self._setup_motion_tab()
 
         # 定时检查队列消息
         self.after(100, self._process_queue)
@@ -200,6 +206,142 @@ class PanoramaApp(ctk.CTk):
         # 初始化日期列表
         self._scan_history()
 
+    # ────────────── 菜单3: 移动侦测 ──────────────
+
+    def _setup_motion_tab(self):
+        """布局「移动侦测」页面"""
+        # 左侧控制面板
+        left = ctk.CTkFrame(self.tab_motion, width=320)
+        left.pack(side="left", fill="y", padx=(0, 8))
+        left.pack_propagate(False)
+
+        ctk.CTkLabel(left, text="移动侦测控制", font=("", 14, "bold")
+                     ).pack(anchor="w", padx=10, pady=(10, 5))
+
+        # 状态
+        self.lbl_motion_status = ctk.CTkLabel(
+            left, text="● 未启动", text_color="gray", font=("", 13))
+        self.lbl_motion_status.pack(anchor="w", padx=10, pady=2)
+
+        self.lbl_motion_count = ctk.CTkLabel(
+            left, text="告警次数: 0", font=("", 13))
+        self.lbl_motion_count.pack(anchor="w", padx=10, pady=2)
+
+        # 灵敏度
+        ctk.CTkLabel(left, text="灵敏度", font=("", 12)).pack(
+            anchor="w", padx=10, pady=(10, 0))
+        self.slider_sensitivity = ctk.CTkSlider(
+            left, from_=1, to_=10, number_of_steps=9)
+        self.slider_sensitivity.set(5)
+        self.slider_sensitivity.pack(fill="x", padx=10, pady=2)
+        self.lbl_sens_value = ctk.CTkLabel(left, text="5", font=("", 11))
+        self.lbl_sens_value.pack(anchor="w", padx=10)
+        self.slider_sensitivity.configure(
+            command=lambda v: self.lbl_sens_value.configure(text=str(int(v)))
+        )
+
+        # 冷却时间
+        ctk.CTkLabel(left, text="通知冷却（秒）", font=("", 12)).pack(
+            anchor="w", padx=10, pady=(10, 0))
+        self.slider_cooldown = ctk.CTkSlider(
+            left, from_=10, to_=120, number_of_steps=11)
+        self.slider_cooldown.set(30)
+        self.slider_cooldown.pack(fill="x", padx=10, pady=2)
+        self.lbl_cd_value = ctk.CTkLabel(left, text="30s", font=("", 11))
+        self.lbl_cd_value.pack(anchor="w", padx=10)
+        self.slider_cooldown.configure(
+            command=lambda v: self.lbl_cd_value.configure(text=f"{int(v)}s")
+        )
+
+        # 控制按钮
+        btn_frame = ctk.CTkFrame(left)
+        btn_frame.pack(fill="x", padx=10, pady=15)
+
+        self.btn_motion_start = ctk.CTkButton(
+            btn_frame, text="▶ 启动侦测",
+            command=self._on_motion_start,
+            height=36, fg_color="green", hover_color="darkgreen"
+        )
+        self.btn_motion_start.pack(side="left", padx=(0, 5), fill="x", expand=True)
+
+        self.btn_motion_stop = ctk.CTkButton(
+            btn_frame, text="■ 停止",
+            command=self._on_motion_stop,
+            height=36, fg_color="red", hover_color="darkred",
+            state="disabled"
+        )
+        self.btn_motion_stop.pack(side="left", padx=(5, 0), fill="x", expand=True)
+
+        # 告警日志
+        ctk.CTkLabel(left, text="告警记录", font=("", 12, "bold")
+                     ).pack(anchor="w", padx=10, pady=(5, 0))
+        self.txt_motion_log = ctk.CTkTextbox(
+            left, font=("Consolas", 11), state="disabled", wrap="word")
+        self.txt_motion_log.pack(fill="both", expand=True, padx=10, pady=5)
+
+        # 右侧：实时预览
+        right = ctk.CTkFrame(self.tab_motion)
+        right.pack(side="right", fill="both", expand=True)
+
+        ctk.CTkLabel(right, text="监控画面", font=("", 14, "bold")
+                     ).pack(anchor="n", padx=10, pady=(10, 5))
+
+        self.lbl_motion_preview = ctk.CTkLabel(
+            right, text="等待启动...",
+            fg_color=("gray20", "gray10"), corner_radius=8)
+        self.lbl_motion_preview.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+    def _on_motion_start(self):
+        """启动移动侦测"""
+        if self.config is None:
+            self._log_motion("摄像头未配置")
+            return
+
+        if self.motion_detector and self.motion_detector.is_running:
+            self._log_motion("侦测已运行")
+            return
+
+        sensitivity = int(self.slider_sensitivity.get())
+        cooldown = int(self.slider_cooldown.get())
+        min_area = {1: 8000, 3: 5000, 5: 3000, 7: 1500, 10: 500}.get(sensitivity, 3000)
+
+        self.motion_detector = MotionDetector(
+            self.config,
+            interval=0.5,
+            min_area=min_area,
+            cooldown=cooldown,
+            sensitivity=sensitivity,
+            callback=self._on_motion_alert,
+        )
+
+        self.motion_detector.start()
+        self.btn_motion_start.configure(state="disabled")
+        self.btn_motion_stop.configure(state="normal")
+        self.lbl_motion_status.configure(
+            text="● 侦测中", text_color="green")
+        self._log_motion(f"侦测已启动 (灵敏度={sensitivity}, 冷却={cooldown}s)")
+
+    def _on_motion_stop(self):
+        """停止移动侦测"""
+        if self.motion_detector:
+            self.motion_detector.stop()
+        self.btn_motion_start.configure(state="normal")
+        self.btn_motion_stop.configure(state="disabled")
+        self.lbl_motion_status.configure(text="● 已停止", text_color="gray")
+        self._log_motion("侦测已停止")
+
+    def _on_motion_alert(self, info: dict):
+        """移动侦测告警回调（工作线程调用）"""
+        self.gui_queue.put_nowait(("motion_alert", info))
+
+    def _log_motion(self, text: str):
+        """追加移动侦测日志"""
+        self.txt_motion_log.configure(state="normal")
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.txt_motion_log.insert("end", f"[{ts}] {text}\n")
+        self.txt_motion_log.see("end")
+        self.txt_motion_log.configure(state="disabled")
+
     # ────────────── 按钮事件 ──────────────
 
     def _on_start(self):
@@ -320,6 +462,14 @@ class PanoramaApp(ctk.CTk):
         elif type_ == "status":
             status = msg[1] if len(msg) > 1 else ""
             self.lbl_status.configure(text=f"状态: {status}")
+
+        elif type_ == "motion_alert":
+            info = msg[1] if len(msg) > 1 else {}
+            t = info.get("time", "")
+            snap = info.get("snapshot", "")
+            self.lbl_motion_count.configure(
+                text=f"告警次数: {self.motion_detector.alert_count if self.motion_detector else 0}")
+            self._log_motion(f"🚶 人员移动! {t}  {snap}")
 
         elif type_ == "done":
             out_path = msg[1] if len(msg) > 1 else ""
@@ -487,6 +637,8 @@ class PanoramaApp(ctk.CTk):
     def destroy(self):
         """关闭窗口时清理"""
         self._stop_worker = True
+        if self.motion_detector:
+            self.motion_detector.stop()
         super().destroy()
 
 
